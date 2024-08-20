@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Servo.h>
 #include <LSM6DS3.h> // IMU driver
 #include "Adafruit_AHRS_NXPFusion.h"
 // #include <Kalman.cpp> // Kalman filter
@@ -7,11 +8,12 @@
 
 // constants
 const float G = 9.81; // gravity
-float PID_GAINS[3] = {1,0.1,1}; // PID gains
-const float dt = 0.1; // integration timestep
+const float PID_GAINS[3] = {1, 0.01, 0.01}; // PID gains
+const float SERVO_LOOP_FREQ = 100; // Hz
 
 // instantiate IMU (I2C device address 0x6A)
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
+Servo laser_servo;
 
 struct IMUReading {
     float a[3] = {0,0,0}; // acceleration
@@ -45,19 +47,35 @@ IMUReading readIMU(void) {
     return imu_reading;
 }
 
-void update_servo(float current_pitch, float target_pitch, ServoError& error_state, float* pid_gains) {
+float servo_angle = 0;
+float update_servo(float measured_pitch, float target_pitch, ServoError& error_state) {
+    // measured pitch is angle of housing relative to ground
+    // target pitch is laser angle relative to ground
+    // servo angle is relative to housing (assume this is updated instantaneously)
+    // so want target pitch = measured pitch + servo angle
+
     // calculate error
-    float e_new = target_pitch - current_pitch;
-    error_state.e_dot = (e_new - error_state.e)/dt;
-    error_state.e_int += e_new*dt;
-    error_state.e = e_new;
+    float pitch_error = target_pitch - (servo_angle + measured_pitch);
+    float alpha = 0.5;
+    error_state.e_dot = alpha * error_state.e_dot + (1 - alpha) * (pitch_error - error_state.e) * SERVO_LOOP_FREQ;
+    error_state.e_int += pitch_error / SERVO_LOOP_FREQ;
+    error_state.e = pitch_error;
 
     // calculate control signal
-    float u = pid_gains[0]*error_state.e + pid_gains[1]*error_state.e_dot + pid_gains[2]*error_state.e_int;
+    float update = PID_GAINS[0]*error_state.e + PID_GAINS[1]*error_state.e_dot + PID_GAINS[2]*error_state.e_int;
 
     // update servo
+    servo_angle += update;
+    if(servo_angle > 180)
+        servo_angle = 180;
+    else if(servo_angle < 0)
+        servo_angle = 0;
+    laser_servo.write(int(servo_angle));
+
+    return servo_angle;
 }
 
+// init Kalman filter
 Adafruit_NXPSensorFusion kf;
 
 void setup() {
@@ -69,6 +87,11 @@ void setup() {
     Serial.println("Failed to initialize IMU!");
     while (1);
     }
+
+    // attach servo (digital pin 9)
+    // initialize to midpoint
+    laser_servo.attach(8);
+    laser_servo.write(90);
 
     // init gyro offset
     int n_steps = 100;
@@ -99,31 +122,26 @@ void setup() {
 }
 
 // global variables
-// IMUReading imu_current; // current IMU reading
-// IMUReading imu_prev; // previous IMU reading
-State state_current; // current state
 ServoError error_state; // servo error
+unsigned long t_servo = 0; // track last servo update
+unsigned long t_kalman = 0; // track last kalman update
+unsigned long t = 0;
+float command_angle = -1;
 
 void loop() {
-  // read IMU
+    // read IMU
     IMUReading imu_data = readIMU();
 
     // kalman update
+    // t = millis();
+    // float dt = t - t_kalman; // for flexible kalman update (TODO)
     kf.update(imu_data.w[0], imu_data.w[1], imu_data.w[2],
         imu_data.a[0], imu_data.a[1], imu_data.a[2], 
         0.0, 0.0, 0.0);
     
-    // Print the orientation filter output
     float roll = kf.getRoll();
     float pitch = kf.getPitch();
     // float yaw = kf.getYaw();
-    Serial.print(millis());
-    Serial.print(" - Orientation: ");
-    Serial.print(roll);
-    Serial.print(" ");
-    Serial.println(pitch);
-    // Serial.print(" ");
-    // Serial.println(yaw);
 
     // Serial.print("Accel X: "); Serial.print(imu_data.a[0], 3);
     // Serial.print(" Y: "); Serial.print(imu_data.a[1], 3);
@@ -132,8 +150,24 @@ void loop() {
     // Serial.print(" Y: "); Serial.print(imu_data.w[1], 3);
     // Serial.print(" Z: "); Serial.println(imu_data.w[2], 3);
 
-    // control loop for pitch
-    update_servo(roll, 0, error_state, PID_GAINS);
+    // control loop for pitch (lower frequency than sensor update)
+    // t = millis();
+    // if(t - t_servo > 50) {
+    //     int target_angle = 90;
+    //     command_angle = update_servo(roll, target_angle, error_state);
+    //     t_servo = t; // reset servo update timer
+    // }
+    int target_angle = 90;
+    command_angle = update_servo(roll, target_angle, error_state);
+
+    // print estimated orientation
+    Serial.print(millis());
+    Serial.print(" - Orientation: ");
+    Serial.print(roll);
+    Serial.print(" ");
+    Serial.println(pitch);
+    Serial.print(" - Command angle: ");
+    Serial.println(command_angle);
 
     delay(10);
 }
